@@ -40,9 +40,12 @@ class Results:
     question: str
     status: str
     objective: float
-    hourly: pd.DataFrame                   # one row per hour: variables, prices, hourly duals
-    duals: dict[str, float] = field(default_factory=dict)   # duals of non-hourly constraints
-    meta: dict = field(default_factory=dict)                 # anything else worth keeping (scenario name, ...)
+    # one row per hour: variables, prices, hourly duals
+    hourly: pd.DataFrame
+    # duals of non-hourly constraints
+    duals: dict[str, float] = field(default_factory=dict)
+    # anything else worth keeping (scenario name, ...)
+    meta: dict = field(default_factory=dict)
 
     def save(self, folder: Path | str, tag: str = "") -> None:
         """Write ``hourly`` to CSV and the scalar values to a small text file."""
@@ -51,7 +54,8 @@ class Results:
         stem = f"{self.question}{'_' + tag if tag else ''}"
         self.hourly.to_csv(folder / f"{stem}_hourly.csv", index_label="hour")
         with open(folder / f"{stem}_summary.txt", "w", encoding="utf-8") as f:
-            f.write(f"status    : {self.status}\nobjective : {self.objective:.4f} DKK\n")
+            f.write(
+                f"status    : {self.status}\nobjective : {self.objective:.4f} DKK\n")
             for k, v in self.duals.items():
                 f.write(f"dual[{k}] : {v:.4f}\n")
 
@@ -59,7 +63,8 @@ class Results:
         cols = [c for c in self.hourly.columns if not c.startswith("dual_")]
         return (
             f"status: {self.status} | objective: {self.objective:.2f} DKK\n"
-            f"daily totals (kWh): " + ", ".join(f"{c}={self.hourly[c].sum():.1f}" for c in cols if c in ("import", "export", "load", "pv"))
+            f"daily totals (kWh): " + ", ".join(
+                f"{c}={self.hourly[c].sum():.1f}" for c in cols if c in ("import", "export", "load", "pv"))
             + (f"\nduals: {self.duals}" if self.duals else "")
         )
 
@@ -77,19 +82,27 @@ class FlexibleConsumerModel:
         self.T = range(data.n_hours)
         self.m = gp.Model(name)
         self.m.Params.OutputFlag = 1 if verbose else 0
-        self.m.Params.QCPDual = 1          # only relevant if you add a quadratic constraint (none is needed in Assignment 1)
-        self.var: dict[str, gp.tupledict | gp.Var] = {}   # decision variables by name
-        self.con: dict[str, gp.tupledict | gp.Constr] = {}  # constraints by name (duals read from here)
+        # only relevant if you add a quadratic constraint (none is needed in Assignment 1)
+        self.m.Params.QCPDual = 1
+        # decision variables by name
+        self.var: dict[str, gp.tupledict | gp.Var] = {}
+        # constraints by name (duals read from here)
+        self.con: dict[str, gp.tupledict | gp.Constr] = {}
 
     # ------------------------------------------------------------------ 2. build
     def build(self) -> "FlexibleConsumerModel":
-        """Declare decision variables, objective and constraints.
-
-        TODO (Question 1): complete this method with the variables, objective and constraints
-        of the problem you formulated in Question 1. Keep the naming pattern below so
-        that ``solve()`` can return the primal and dual values automatically.
         """
+        Question 1: maximize the daily surplus of the price-elastic consumer.
+        max sum_t [u_Load * load_t - c_PV * pv_t - pi_imp_t * import_t + pi_exp_t * export_t]
+        s.t.
+        hourly balance, PV availability, load bounds (all bounds as explicit constraints to get duals).
+        """
+
         d, m, T = self.data, self.m, self.T
+
+        # Effective prices (DKK/kWh): what the consumer actually pays / receives
+        pi_imp = d.energy_price + d.import_tariff
+        pi_exp = d.energy_price - d.export_tariff
 
         # --- Decision variables --------------------------------------------------------
         # TODO: identify and declare the decision variables of your formulation.
@@ -108,11 +121,24 @@ class FlexibleConsumerModel:
         #   a bound you want a dual for must be an explicit constraint, not lb=/ub= (see the README).
         # * naming the families "import", "export", "load", "pv" makes the standard plots of
         #   src/plotting.py work out of the box.
+        self.var["load"] = m.addVars(T, name="load")
+        self.var["pv"] = m.addVars(T, name="pv")
+        self.var["import"] = m.addVars(T, name="import")
+        self.var["export"] = m.addVars(T, name="export")
+        load, pv = self.var["load"], self.var["pv"]
+        imp, exp = self.var["import"], self.var["export"]
 
         # --- Objective ---------------------------------------------------------------
         # TODO: express the objective function and its direction (GRB.MINIMIZE or GRB.MAXIMIZE):
         #   m.setObjective(gp.quicksum(<expression in t> for t in T), <direction>)
         # The input-data attributes (with units) are documented in src/data_loader.py (InputData).
+        m.setObjective(
+            gp.quicksum(d.consumption_utility * load[t]
+                        - d.pv_marginal_cost * pv[t]
+                        - pi_imp[t] * imp[t]
+                        + pi_exp[t] * exp[t] for t in T),
+            GRB.MAXIMIZE
+        )
 
         # --- Constraints -------------------------------------------------------------
         # TODO: add the constraints of your formulation.
@@ -122,6 +148,22 @@ class FlexibleConsumerModel:
         #       (<lhs expression> - <rhs expression> <= 0 for t in T), name="<name>")
         # Pattern for a single constraint (dual returned as a scalar):
         #   self.con["<name>"] = m.addConstr(<lhs expression> - <rhs expression> <= 0, name="<name>")
+
+        # Hourly energy balance (sources = sinks), dual = lambda_t
+        self.con["balance"] = m.addConstrs(
+            (pv[t] + imp[t] == load[t] + exp[t] for t in T), name="balance"
+        )
+        # PV availability dual = mu_pv_max_t
+        self.con["pv_max"] = m.addConstrs(
+            (pv[t] <= d.pv_available[t] for t in T), name="pv_max"
+        )
+        # Hourly load bounds as explicit constraints (duals), not as variable bounds
+        self.con["load_min"] = m.addConstrs(
+            (load[t] >= d.load_min_kWh for t in T), name="load_min"
+        )
+        self.con["load_max"] = m.addConstrs(
+            (load[t] <= d.load_max_kWh for t in T), name="load_max"
+        )
 
         m.update()
         return self
@@ -138,7 +180,8 @@ class FlexibleConsumerModel:
         m.optimize()
         status = _status_name(m.Status)
         if m.Status != GRB.OPTIMAL:
-            raise RuntimeError(f"Optimisation ended with status {status}. Check the model (m.computeIIS() helps for infeasibility).")
+            raise RuntimeError(
+                f"Optimisation ended with status {status}. Check the model (m.computeIIS() helps for infeasibility).")
         return self._extract_results(status)
 
     # --------------------------------------------------------------- extraction
@@ -154,7 +197,8 @@ class FlexibleConsumerModel:
         for name, v in self.var.items():
             if isinstance(v, gp.tupledict):
                 hourly[name] = [v[t].X for t in T]
-        scalars = {name: v.X for name, v in self.var.items() if isinstance(v, gp.Var)}
+        scalars = {name: v.X for name,
+                   v in self.var.items() if isinstance(v, gp.Var)}
 
         # Dual values: every constraint family in self.con becomes a 'dual_<name>' column or scalar
         duals: dict[str, float] = {}
