@@ -88,6 +88,8 @@ class FlexibleConsumerModel:
         self.var: dict[str, gp.tupledict | gp.Var] = {}
         # constraints by name (duals read from here)
         self.con: dict[str, gp.tupledict | gp.Constr] = {}
+        # objective components by name (values read from here after solve)
+        self.expr: dict[str, gp.LinExpr | gp.QuadExpr] = {}
 
     # ------------------------------------------------------------------ 2. build
     def build(self) -> "FlexibleConsumerModel":
@@ -121,7 +123,7 @@ class FlexibleConsumerModel:
         #   a bound you want a dual for must be an explicit constraint, not lb=/ub= (see the README).
         # * naming the families "import", "export", "load", "pv" makes the standard plots of
         #   src/plotting.py work out of the box.
-        self.var["load"] = m.addVars(T, name="load")
+        self.var["load"] = m.addVars(T, lb= -GRB.INFINITY, name="load")
         self.var["pv"] = m.addVars(T, name="pv")
         self.var["import"] = m.addVars(T, name="import")
         self.var["export"] = m.addVars(T, name="export")
@@ -132,11 +134,13 @@ class FlexibleConsumerModel:
         # TODO: express the objective function and its direction (GRB.MINIMIZE or GRB.MAXIMIZE):
         #   m.setObjective(gp.quicksum(<expression in t> for t in T), <direction>)
         # The input-data attributes (with units) are documented in src/data_loader.py (InputData).
+        utility = gp.quicksum(d.consumption_utility * load[t] for t in T)
+        procurement_cost = gp.quicksum(d.pv_marginal_cost * pv[t] +  
+                                         pi_imp[t] * imp[t] - pi_exp[t] * exp[t] for t in T)
+        self.expr["utility"] = utility
+        self.expr["procurement_cost"] = procurement_cost
         m.setObjective(
-            gp.quicksum(d.consumption_utility * load[t]
-                        - d.pv_marginal_cost * pv[t]
-                        - pi_imp[t] * imp[t]
-                        + pi_exp[t] * exp[t] for t in T),
+            utility - procurement_cost,
             GRB.MAXIMIZE
         )
 
@@ -151,7 +155,7 @@ class FlexibleConsumerModel:
 
         # Hourly energy balance (sources = sinks), dual = lambda_t
         self.con["balance"] = m.addConstrs(
-            (pv[t] + imp[t] == load[t] + exp[t] for t in T), name="balance"
+            (load[t] + exp[t] - pv[t] - imp[t] == 0 for t in T), name="balance" # Follow the pattern above to get duals of equality constraints
         )
         # PV availability dual = mu_pv_max_t
         self.con["pv_max"] = m.addConstrs(
@@ -159,7 +163,7 @@ class FlexibleConsumerModel:
         )
         # Hourly load bounds as explicit constraints (duals), not as variable bounds
         self.con["load_min"] = m.addConstrs(
-            (load[t] >= d.load_min_kWh for t in T), name="load_min"
+            (d.load_min_kWh - load[t] <= 0  for t in T), name="load_min" # This expression is to let dual variables be positive
         )
         self.con["load_max"] = m.addConstrs(
             (load[t] <= d.load_max_kWh for t in T), name="load_max"
